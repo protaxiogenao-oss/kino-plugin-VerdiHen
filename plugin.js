@@ -1,13 +1,14 @@
 /// <reference path="./kino.d.ts" />
 /**
- * VerHentai — Kino plugin v1.0.0
+ * VerHentai — Kino plugin v1.0.1
  * Author: Hotaru Yume / hotaruyume
  * Fuente: verhentai.com
  * - Home con las mismas secciones de la web (Estrenos, Tendencias, Sin Censura, Incesto, Milfs, Furry)
  * - Series + episodios
  * - Resolve vía player-logic API → HLS octopusmanifest
- * - Subtítulos online: prioridad español (es), luego resto
+ * - Subtítulos online: español genérico (es) por defecto / primero
  * - Sin anuncios / embeds de ads
+ * v1.0.1: label "Español" genérico; es siempre primero en la lista
  */
 
 const BASE = "https://verhentai.com";
@@ -467,7 +468,7 @@ export async function resolve(ref) {
     throw new Error("url de stream inválida");
   }
 
-  // Prefer Spanish subtitles: parse master playlist
+  // Subtítulos: español genérico (es) siempre primero y con label "Español"
   var subtitles = [];
   try {
     var plRes = await kino.fetch(m3u8, {
@@ -482,28 +483,44 @@ export async function resolve(ref) {
       var basePl = m3u8.replace(/\/[^/]*$/, "/");
       var found = [];
       while ((sm = subRe.exec(pl))) {
-        var lang = sm[1].toLowerCase();
-        var name = sm[2] || lang;
+        var lang = (sm[1] || "").toLowerCase();
         var uri = sm[3];
         if (uri.indexOf("http") !== 0) uri = basePl + uri.replace(/^\.\//, "");
-        found.push({ lang: lang, url: uri, format: uri.indexOf(".vtt") >= 0 ? "vtt" : undefined, label: name });
+        // Normalizar a español genérico
+        var isEs = lang === "es" || lang === "spa" || lang.indexOf("es-") === 0 || lang.indexOf("es_") === 0;
+        var isEn = lang === "en" || lang === "eng" || lang.indexOf("en-") === 0;
+        var outLang = isEs ? "es" : isEn ? "en" : lang;
+        var outLabel = isEs ? "Español" : isEn ? "English" : (sm[2] || lang);
+        found.push({
+          lang: outLang,
+          url: uri,
+          format: uri.indexOf(".vtt") >= 0 ? "vtt" : undefined,
+          label: outLabel,
+        });
       }
-      // priority: es first, then en, then rest
+      // Español genérico primero, luego inglés, luego el resto
       found.sort(function (a, b) {
         var score = function (l) {
-          if (l === "es" || l === "spa" || l === "es-es" || l === "es-mx") return 0;
-          if (l === "en" || l === "eng") return 1;
+          if (l === "es") return 0;
+          if (l === "en") return 1;
           return 2;
         };
         return score(a.lang) - score(b.lang);
       });
-      subtitles = found;
+      // Evitar duplicados de lang (quedarse con el primero = el de mayor prioridad)
+      var seenLang = {};
+      subtitles = [];
+      for (var i = 0; i < found.length; i++) {
+        if (seenLang[found[i].lang]) continue;
+        seenLang[found[i].lang] = true;
+        subtitles.push(found[i]);
+      }
     }
   } catch (e) {
     // ignore subtitle parse errors
   }
 
-  // also try direct known paths if playlist didn't list them
+  // Si el master no listó pistas, forzar español genérico + inglés
   if (subtitles.length === 0) {
     var baseUuid = m3u8.replace(/\/playlist[^/]*\.m3u8.*$/i, "/");
     subtitles = [
