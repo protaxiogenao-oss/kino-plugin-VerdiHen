@@ -1,703 +1,528 @@
-// VerHentai (ver-hentai.online) — Hentai sub español
-// v1.2.0: miniaturas, servidores reales (sin anuncios), reproducción en todas las filas
-
-const BASE = "https://www.ver-hentai.online";
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-
-// Dominios de anuncio / tracking / captcha — nunca usar como stream
-const AD_HOSTS =
-  /benchform\.org|biomanos\.org|exoclick|magsrv|pemsrv|popunder|doubleclick|googlesyndication|adservice|histats|clickadu|juicyads|trafficjunky|adsterra|propeller|tsyndicate|es\.xxxgames|vhentaicommunity\.jimdofree|comunidad\.hentaird|t\.me|tiktok\.com|instagram\.com|youtube\.com|facebook\.com/i;
-
-// Embeds que suelen pedir captcha o no dan stream usable en Kino
-const SKIP_EMBED =
-  /do7go\.com|dood\.(watch|stream|to|la|ws|so|pm|sh|work)|ds2play|ds2video|playmogo\.com/i;
-
-const PREFERRED = [
-  "Filemoon",
-  "Lulu",
-  "SaveFiles",
-  "Voe",
-  "Gupload",
-  "VidHide",
-  "Sendvid",
-  "UpFiles",
-  "UsersDrive",
-  "Firestream",
-];
-
-function log(...args) {
-  try {
-    kino.log(...args);
-  } catch {}
-}
-
-async function fetchText(url) {
-  const r = await kino.fetch(url, {
-    headers: {
-      "User-Agent": UA,
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-      Referer: BASE + "/",
-    },
-    cookies: false,
-    timeoutMs: 15000,
-  });
-  if (!r.ok) throw kino.error("unavailable", "ver-hentai.online respondió " + r.status);
-  return r.text();
-}
-
-function cleanTitle(t) {
-  return String(t || "")
-    .replace(/\s+/g, " ")
-    .replace(/Sub Español/gi, "")
-    .replace(/&amp;/g, "&")
-    .replace(/&#039;/g, "'")
-    .replace(/&quot;/g, '"')
-    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
-    .trim()
-    .slice(0, 200);
-}
-
-function isAdUrl(url) {
-  if (!url) return true;
-  try {
-    const h = new URL(url).hostname;
-    if (AD_HOSTS.test(h)) return true;
-  } catch {
-    return true;
-  }
-  return false;
-}
-
-function pickPoster(block) {
-  if (!block) return undefined;
-  // Prefer real covers from zx89 CDN
-  const patterns = [
-    /src="(https?:\/\/[^"]*zx89\.site\/hentai\/(?:portadas|miniportadas|covers)[^"]+)"/i,
-    /src="(https?:\/\/[^"]*zx89\.site\/[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/i,
-    /src="(https?:\/\/[^"]*hentaisd\.tv\/[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/i,
-    /src="(https?:\/\/[^"]+(?:portadas|miniportadas|covers|poster)[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/i,
-    /src="(https?:\/\/s4\.zx89\.site\/[^"]+)"/i,
-  ];
-  for (const re of patterns) {
-    const m = block.match(re);
-    if (m && !isAdUrl(m[1])) return m[1].replace(/&amp;/g, "&");
-  }
-  return undefined;
-}
-
-function seriesFromEpisodePath(path) {
-  // /hentaionline/slug-3.html → { seriesSlug, epNum }
-  const m = String(path).match(/\/hentaionline\/([a-z0-9\-_.]+)-(\d+)\.html/i);
-  if (!m) return null;
-  return { seriesSlug: m[1], epNum: parseInt(m[2], 10) };
-}
-
+/// <reference path="./kino.d.ts" />
 /**
- * Parse series/episode cards from any listing page.
- * Handles <article> (directorio) and a.episode-card (home "nuevos").
+ * VerHentai — Kino plugin v1.0.0
+ * Author: Hotaru Yume / hotaruyume
+ * Fuente: verhentai.com
+ * - Home con las mismas secciones de la web (Estrenos, Tendencias, Sin Censura, Incesto, Milfs, Furry)
+ * - Series + episodios
+ * - Resolve vía player-logic API → HLS octopusmanifest
+ * - Subtítulos online: prioridad español (es), luego resto
+ * - Sin anuncios / embeds de ads
  */
-function parseCards(html) {
-  const items = [];
-  const seen = new Set();
 
-  // Strip scripts so we don't pick JSON carousel entries without real cards
-  const body = String(html).replace(/<script[\s\S]*?<\/script>/gi, " ");
+const BASE = "https://verhentai.com";
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
-  function pushSeries(slug, title, poster) {
-    if (!slug || seen.has(slug)) return;
-    if (/^(page|login|register|search|dir)/i.test(slug)) return;
-    seen.add(slug);
-    items.push({
-      id: slug,
-      ref: "series:" + slug,
-      title: cleanTitle(title || slug.replace(/-/g, " ")),
-      kind: "series",
-      poster: poster || undefined,
-      adult: true,
-      lang: "es",
-      genres: ["anime"],
-    });
-  }
+const HOME_ROW = 16;
+const MAX_PAGE = 48;
+const AD_RE =
+  /\b(sponsored|sponsor|advert|promo|trafficjunky|exoclick|juicyads|havenclick|outbrain|taboola|click here|buy now|affiliate|brazzers|see more)\b/i;
 
-  // 1) <article>…</article> (directorio, más vistos, sin censura)
-  const articles = body.match(/<article[\s\S]*?<\/article>/gi) || [];
-  for (const art of articles) {
-    const hrefM = art.match(
-      /href="((?:https?:\/\/[^"]+)?\/infohentai\/([a-z0-9\-_.]+)\.html)"/i
-    );
-    if (!hrefM) continue;
-    const slug = hrefM[2];
-    const title =
-      (art.match(/alt="([^"]{2,160})"/i) ||
-        art.match(/<h[23][^>]*>\s*([^<]+)/i) ||
-        [])[1] || slug;
-    pushSeries(slug, title, pickPoster(art));
-  }
-
-  // 2) episode-card blocks (home "nuevos")
-  const epCards =
-    body.match(/<a[^>]+class="[^"]*episode-card[^"]*"[\s\S]*?<\/a>/gi) || [];
-  for (const card of epCards) {
-    const hrefM = card.match(
-      /href="(?:https?:\/\/[^"]+)?\/hentaionline\/([a-z0-9\-_.]+)-(\d+)\.html"/i
-    );
-    if (!hrefM) continue;
-    const seriesSlug = hrefM[1];
-    const title =
-      (card.match(/alt="([^"]{2,160})"/i) ||
-        card.match(/<h[23][^>]*>\s*([^<]+)/i) ||
-        [])[1] || seriesSlug;
-    const clean = String(title).replace(/\s*[-–]\s*Episodio\s*\d+/i, "").trim();
-    pushSeries(seriesSlug, clean, pickPoster(card));
-  }
-
-  // 3) Fallback: any /infohentai/ link with nearby poster
-  if (items.length < 3) {
-    const re =
-      /href="(?:https?:\/\/[^"]+)?(\/infohentai\/([a-z0-9\-_.]+)\.html)"/gi;
-    let m;
-    while ((m = re.exec(body))) {
-      const slug = m[2];
-      if (seen.has(slug)) continue;
-      const start = Math.max(0, m.index - 200);
-      const end = Math.min(body.length, m.index + 1800);
-      const block = body.slice(start, end);
-      const poster = pickPoster(block);
-      if (!poster) continue;
-      const title =
-        (block.match(/alt="([^"]{2,160})"/i) ||
-          block.match(/<h[23][^>]*>\s*([^<]+)/i) ||
-          [])[1] || slug;
-      pushSeries(slug, title, poster);
-    }
-  }
-
-  // 4) Fallback episode links
-  if (items.length < 5) {
-    const epRe =
-      /href="(?:https?:\/\/[^"]+)?(\/hentaionline\/([a-z0-9\-_.]+)-(\d+)\.html)"/gi;
-    let em;
-    while ((em = epRe.exec(body))) {
-      const seriesSlug = em[2];
-      if (seen.has(seriesSlug)) continue;
-      const start = Math.max(0, em.index - 150);
-      const end = Math.min(body.length, em.index + 1200);
-      const block = body.slice(start, end);
-      const title =
-        (block.match(/alt="([^"]{2,160})"/i) || [])[1] || seriesSlug;
-      const clean = String(title).replace(/\s*[-–]\s*Episodio\s*\d+/i, "").trim();
-      pushSeries(seriesSlug, clean, pickPoster(block));
-    }
-  }
-
-  return items;
+function hdr(extra) {
+  var h = {
+    "User-Agent": UA,
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.5",
+    Referer: BASE + "/",
+  };
+  if (extra) for (var k in extra) h[k] = extra[k];
+  return h;
 }
 
-function parseEpisodeList(html, seriesSlug) {
-  const episodes = [];
-  const found = new Set();
-  const esc = seriesSlug.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const re = new RegExp(
-    "href=\"(?:https?:\\/\\/[^\"]+)?\\/hentaionline\\/" + esc + "-(\\d+)\\.html\"",
-    "gi"
-  );
-  let m;
-  while ((m = re.exec(html))) {
-    const num = parseInt(m[1], 10);
-    if (!num || found.has(num)) continue;
-    found.add(num);
-    episodes.push({
-      season: 1,
-      number: num,
-      ref: "ep:" + seriesSlug + ":" + num,
-      title: "Episodio " + num,
-    });
-  }
-  episodes.sort((a, b) => a.number - b.number);
-  return episodes;
+function strip(s) {
+  return String(s || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#0*39;/g, "'")
+    .replace(/&#x27;/gi, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-function serverLabel(url) {
-  const u = url.toLowerCase();
-  if (u.includes("byseraguci") || u.includes("filemoon")) return "Filemoon";
-  if (u.includes("voe.sx") || u.includes("voe-")) return "Voe";
-  if (u.includes("firestream")) return "Firestream";
-  if (u.includes("streamhls") || u.includes("savefiles")) return "SaveFiles";
-  if (u.includes("luluvid") || u.includes("luluvido")) return "Lulu";
-  if (u.includes("gupload")) return "Gupload";
-  if (u.includes("vidhide")) return "VidHide";
-  if (u.includes("sendvid")) return "Sendvid";
-  if (u.includes("upfiles")) return "UpFiles";
-  if (u.includes("usersdrive")) return "UsersDrive";
-  if (u.includes("dood") || u.includes("do7go") || u.includes("playmogo")) return "Doodstream";
-  try {
-    return new URL(url).hostname.replace(/^www\./, "").split(".")[0];
-  } catch {
-    return "Servidor";
-  }
+function abs(u) {
+  if (!u) return "";
+  u = String(u).replace(/&amp;/g, "&").trim();
+  if (!u || u.indexOf("data:") === 0) return "";
+  if (u.indexOf("//") === 0) return "https:" + u;
+  if (u.indexOf("http") === 0) return u;
+  if (u.charAt(0) === "/") return BASE + u;
+  return BASE + "/" + u;
 }
 
-function toEmbedUrl(url) {
-  return String(url)
-    .replace(/\\\\/g, "")
-    .replace(/\\\//g, "/")
-    .replace(/\\u002F/gi, "/")
-    .replace(/\/(d|w|v)\//, "/e/")
-    .replace(/\/f\//, "/e/");
+function makeId(s) {
+  return String(s || "x")
+    .replace(/^https?:\/\/verhentai\.com/i, "")
+    .replace(/[^A-Za-z0-9._~/-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 140);
 }
 
-function extractServers(html) {
-  const servers = [];
-  const seen = new Set();
+function isAdBlock(title, path, block) {
+  var t = (title || "") + " " + (path || "") + " " + (block || "");
+  return AD_RE.test(t);
+}
 
-  function add(raw) {
-    if (!raw) return;
-    let url = toEmbedUrl(String(raw).trim().replace(/&amp;/g, "&"));
-    if (!/^https?:\/\//i.test(url)) return;
-    if (isAdUrl(url)) return;
-    if (SKIP_EMBED.test(url)) return; // captcha / unreliable
-    // only known video hosts
-    if (
-      !/(voe\.sx|firestream\.to|streamhls\.to|luluvid|luluvido|filemoon|byseraguci|savefiles|gupload|vidhide|sendvid|upfiles\.com|usersdrive)/i.test(
-        url
-      )
-    ) {
-      return;
-    }
-    const key = url.replace(/\/+$/, "").toLowerCase();
-    if (seen.has(key)) return;
-    seen.add(key);
-    servers.push({ label: serverLabel(url), url });
-  }
-
-  // Plain URLs
-  const hostRe =
-    /(https?:\/\/(?:voe\.sx|firestream\.to|streamhls\.to|luluvid\.com|luluvido\.com|filemoon\.[a-z]+|byseraguci\.com|savefiles\.com|gupload\.site|vidhidepro\.com|sendvid\.com|upfiles\.com|usersdrive\.com)\/[^\s"'<>\\&]+)/gi;
-  let m;
-  while ((m = hostRe.exec(html))) add(m[1]);
-
-  // HTML-entity encoded JSON: embed_code&quot;:&quot;https:\/\/...
-  const entRe = /embed_code&quot;:&quot;(https?:\\\/\\\/[^&]+)/gi;
-  while ((m = entRe.exec(html))) {
-    add(m[1].replace(/\\\//g, "/"));
-  }
-
-  // Escaped JSON in scripts
-  const escRe = /"embed_code"\s*:\s*"(https?:\\\/\\\/[^"]+)"/gi;
-  while ((m = escRe.exec(html))) {
-    add(m[1].replace(/\\\//g, "/"));
-  }
-
-  // iframe src
-  const iframeRe = /<iframe[^>]+src=["'](https?:\/\/[^"']+)["']/gi;
-  while ((m = iframeRe.exec(html))) add(m[1]);
-
-  servers.sort((a, b) => {
-    const ai = PREFERRED.indexOf(a.label);
-    const bi = PREFERRED.indexOf(b.label);
-    return (ai === -1 ? 50 : ai) - (bi === -1 ? 50 : bi);
+async function fetchText(url, extra) {
+  var r = await kino.fetch(url, {
+    headers: hdr(extra),
+    timeoutMs: 16000,
   });
-
-  return servers;
+  if (!r.ok) throw new Error("HTTP " + r.status + " " + url);
+  return await r.text();
 }
 
-export async function search(query) {
-  const q = (query && query.q ? query.q : "").trim();
-  if (!q) return [];
+function parseItems(html, max) {
+  max = max || MAX_PAGE;
+  var byId = {};
+  var order = [];
 
-  const urls = [
-    BASE + "/directorio?search=" + encodeURIComponent(q),
-    BASE + "/dir-hentai/?search=" + encodeURIComponent(q),
-  ];
+  function ensure(slug) {
+    if (!byId[slug]) {
+      byId[slug] = {
+        id: makeId(slug),
+        ref: "series:" + slug,
+        title: "",
+        poster: "",
+        kind: "series",
+        adult: true,
+      };
+      order.push(slug);
+    }
+    return byId[slug];
+  }
 
-  let items = [];
-  for (const url of urls) {
-    try {
-      const html = await fetchText(url);
-      items = parseCards(html);
-      if (items.length) break;
-    } catch (e) {
-      log("search failed", url, e.message);
+  // .item > a[href*="/online/"] with cover img
+  var reItem =
+    /<div[^>]*class="[^"]*\bitem\b[^"]*"[^>]*>[\s\S]*?<a[^>]+href="((?:https?:\/\/verhentai\.com)?\/online\/([^"/?#]+)\/?)"[^>]*>[\s\S]*?<\/a>[\s\S]*?<\/div>/gi;
+  var m;
+  while ((m = reItem.exec(html))) {
+    var full = m[1];
+    var slug = m[2];
+    if (!slug || /episodio|episode/i.test(slug)) continue;
+    var block = m[0];
+    if (isAdBlock("", slug, block)) continue;
+
+    var rec = ensure(slug);
+
+    var img =
+      block.match(/<img[^>]+src="(https?:\/\/[^"]+)"/i) ||
+      block.match(/data-src="(https?:\/\/[^"]+)"/i) ||
+      block.match(/srcset="(https?:\/\/[^"\s,]+)/i);
+    if (img && !rec.poster) {
+      var p = abs(img[1]);
+      if (p && !/lazy|placeholder|data:|havenclick|ads/i.test(p)) rec.poster = p;
+    }
+
+    var alt = block.match(/alt="([^"]{2,})"/i);
+    if (alt) {
+      var t = strip(alt[1].replace(/\s*cover\s*$/i, ""));
+      if (t.length >= 2) rec.title = t;
+    }
+    if (!rec.title) {
+      var titleEl = block.match(/class="[^"]*title[^"]*"[^>]*>([^<]{2,})/i);
+      if (titleEl) rec.title = strip(titleEl[1]);
+    }
+    if (!rec.title) {
+      // slug to title
+      rec.title = slug
+        .replace(/-/g, " ")
+        .replace(/\b\w/g, function (c) {
+          return c.toUpperCase();
+        });
     }
   }
 
-  if (items.length < 3) {
-    try {
-      const html = await fetchText(BASE + "/dir-hentai/");
-      const all = parseCards(html);
-      const lower = q.toLowerCase();
-      items = all.filter((it) => it.title.toLowerCase().includes(lower)).slice(0, 40);
-    } catch (e) {
-      log("fallback search", e.message);
+  // fallback: any /online/slug/ link with nearby img
+  if (order.length < 4) {
+    var reLink =
+      /<a[^>]+href="((?:https?:\/\/verhentai\.com)?\/online\/([^"/?#]+)\/?)"[^>]*>([\s\S]*?)<\/a>/gi;
+    while ((m = reLink.exec(html))) {
+      var slug2 = m[2];
+      if (!slug2 || /episodio|episode/i.test(slug2)) continue;
+      if (isAdBlock("", slug2, m[3])) continue;
+      var rec2 = ensure(slug2);
+      if (!rec2.poster) {
+        var im = m[3].match(/src="(https?:\/\/[^"]+)"/i) || m[3].match(/data-src="(https?:\/\/[^"]+)"/i);
+        if (im) {
+          var p2 = abs(im[1]);
+          if (p2 && !/lazy|placeholder|havenclick|ads/i.test(p2)) rec2.poster = p2;
+        }
+      }
+      if (!rec2.title || rec2.title.length < 3) {
+        var al = m[3].match(/alt="([^"]{2,})"/i);
+        if (al) rec2.title = strip(al[1].replace(/\s*cover\s*$/i, ""));
+      }
+      if (!rec2.title) {
+        rec2.title = slug2
+          .replace(/-/g, " ")
+          .replace(/\b\w/g, function (c) {
+            return c.toUpperCase();
+          });
+      }
     }
   }
 
-  return items.slice(0, 50);
+  var out = [];
+  for (var i = 0; i < order.length && out.length < max; i++) {
+    var r = byId[order[i]];
+    if (r && r.title && r.title.length >= 2) out.push(r);
+  }
+  return out;
+}
+
+function sectionRef(path) {
+  return "browse:" + path.replace(/^\//, "");
 }
 
 export async function home() {
-  const rows = [];
+  var html = await fetchText(BASE + "/");
+  var rows = [];
 
-  async function addRow(id, title, path, limit, genre) {
-    try {
-      const html = await fetchText(BASE + path);
-      const items = parseCards(html).slice(0, limit);
-      if (items.length) {
-        const row = { id, title, items, ref: "lista:" + id };
-        if (genre) row.genre = genre;
-        rows.push(row);
-      }
-    } catch (e) {
-      log("home", id, e.message);
+  // Extract blocks by h3.htitle
+  var reSec =
+    /<h3[^>]*class="[^"]*htitle[^"]*"[^>]*>\s*([^<]+?)(?:\s*<a[^>]+href="([^"]+)"[^>]*>[\s\S]*?<\/a>)?\s*<\/h3>\s*<div[^>]*class="[^"]*block_slider[^"]*"[^>]*>([\s\S]*?)(?=<h3[^>]*class="[^"]*htitle|<\/div>\s*<\/div>\s*<\/div>\s*<div class="block"|$)/gi;
+
+  var m;
+  var seen = {};
+  while ((m = reSec.exec(html))) {
+    var title = strip(m[1]);
+    if (!title || title.length < 3) continue;
+    var moreHref = m[2] ? abs(m[2]) : "";
+    var blockHtml = m[3] || "";
+    if (seen[title]) continue;
+    seen[title] = true;
+
+    var items = parseItems(blockHtml, HOME_ROW);
+    if (items.length === 0) continue;
+
+    var row = {
+      id: makeId(title),
+      title: title,
+      items: items,
+    };
+    if (moreHref) {
+      var path = moreHref.replace(BASE, "").replace(/\/$/, "") || "/";
+      row.ref = sectionRef(path);
     }
+    rows.push(row);
   }
 
-  await addRow("nuevos", "Nuevos capítulos", "/", 36);
-  await addRow("vistos", "Más vistos", "/hentai-mas-vistos.html", 36);
-  await addRow("sincensura", "Sin censura", "/hentai-sin-censura.html", 30);
-  await addRow("directorio", "Directorio", "/dir-hentai/", 48, "anime");
+  // Fallback if regex missed: known sections
+  if (rows.length === 0) {
+    var all = parseItems(html, HOME_ROW * 3);
+    if (all.length) {
+      rows.push({ id: "home", title: "Hentai", items: all.slice(0, HOME_ROW) });
+    }
+  }
 
   return rows;
 }
 
 export async function browse(ref, cursor) {
-  const map = {
-    "lista:nuevos": "/",
-    "lista:vistos": "/hentai-mas-vistos.html",
-    "lista:sincensura": "/hentai-sin-censura.html",
-    "lista:directorio": "/dir-hentai/",
-  };
+  var path = String(ref || "").replace(/^browse:/, "");
+  if (!path) path = "/";
+  if (path.charAt(0) !== "/") path = "/" + path;
 
-  const path = map[ref] || "/dir-hentai/";
-  const page = cursor ? parseInt(cursor, 10) || 1 : 1;
+  var page = 1;
+  if (cursor) {
+    var cm = String(cursor).match(/page=(\d+)/);
+    if (cm) page = parseInt(cm[1], 10) || 1;
+  }
 
-  let url = BASE + path;
+  var url = BASE + path;
   if (page > 1) {
-    url += (url.includes("?") ? "&" : "?") + "page=" + page;
+    if (url.indexOf("?") >= 0) url += "&page=" + page;
+    else url += (url.slice(-1) === "/" ? "" : "/") + "page/" + page + "/";
   }
 
-  const html = await fetchText(url);
-  const items = parseCards(html).slice(0, 48);
+  var html = await fetchText(url);
+  var items = parseItems(html, MAX_PAGE);
 
-  let next = undefined;
-  if (
-    html.includes("page=" + (page + 1)) ||
-    html.includes("?page=" + (page + 1)) ||
-    items.length >= 20
-  ) {
-    next = String(page + 1);
+  var next = null;
+  if (items.length >= Math.min(20, MAX_PAGE - 4)) {
+    next = "page=" + (page + 1);
+  }
+  // also check for next link
+  if (!next && /rel="next"|class="[^"]*next[^"]*"|›|»|Siguiente/i.test(html)) {
+    next = "page=" + (page + 1);
   }
 
-  return next ? { items, next } : { items };
+  return { items: items, next: next };
+}
+
+export async function search(query) {
+  var q = (query && query.q) || "";
+  if (!q || !String(q).trim()) return [];
+
+  var page = 1;
+  if (query.cursor) {
+    var cm = String(query.cursor).match(/page=(\d+)/);
+    if (cm) page = parseInt(cm[1], 10) || 1;
+  }
+
+  var url = BASE + "/?s=" + encodeURIComponent(String(q).trim());
+  if (page > 1) url += "&page=" + page;
+
+  var html = await fetchText(url);
+  var items = parseItems(html, MAX_PAGE);
+
+  var next = null;
+  if (items.length >= 20) next = "page=" + (page + 1);
+
+  if (query.cursor || next) {
+    return { items: items, next: next };
+  }
+  return items;
 }
 
 export async function episodes(ref) {
-  const seriesSlug = String(ref || "").replace(/^series:/, "");
-  if (!seriesSlug) throw kino.error("not_found", "Serie no encontrada");
+  var slug = String(ref || "").replace(/^series:/, "").replace(/^\/online\//, "").replace(/\/$/, "");
+  if (!slug) throw new Error("ref inválido");
 
-  let html = null;
-  const candidates = [
-    BASE + "/infohentai/" + seriesSlug + ".html",
-    BASE + "/infohentai/" + seriesSlug.replace(/_/g, "-") + ".html",
-  ];
-  let lastErr = null;
-  for (const url of candidates) {
-    try {
-      html = await fetchText(url);
-      break;
-    } catch (e) {
-      lastErr = e;
-    }
+  var url = BASE + "/online/" + slug + "/";
+  var html = await fetchText(url);
+
+  // series info
+  var seriesTitle = "";
+  var tm = html.match(/<h1[^>]*>([^<]{2,})<\/h1>/i) || html.match(/property="og:title"\s+content="([^"]+)"/i);
+  if (tm) seriesTitle = strip(tm[1]);
+
+  var poster = "";
+  var pm =
+    html.match(/property="og:image"\s+content="(https?:\/\/[^"]+)"/i) ||
+    html.match(/class="[^"]*cover[^"]*"[^>]*>[\s\S]*?<img[^>]+src="(https?:\/\/[^"]+)"/i);
+  if (pm) poster = abs(pm[1]);
+
+  var overview = "";
+  var om = html.match(/property="og:description"\s+content="([^"]+)"/i);
+  if (om) overview = strip(om[1]);
+
+  var year = "";
+  var ym = html.match(/>\s*(20\d{2})\s*</);
+  if (ym) year = ym[1];
+
+  // episodes list
+  var eps = [];
+  var reEp =
+    /<a[^>]+href="((?:https?:\/\/verhentai\.com)?\/online\/[^"]+\/episodio-(\d+)\/?)"[^>]*>[\s\S]*?(?:Episodio\s*(\d+)|Episode\s*(\d+))?[\s\S]*?<\/a>/gi;
+  var seen = {};
+  var m;
+  while ((m = reEp.exec(html))) {
+    var num = parseInt(m[2] || m[3] || m[4], 10);
+    if (!num || seen[num]) continue;
+    seen[num] = true;
+
+    var still = "";
+    var sm = m[0].match(/src="(https?:\/\/[^"]+)"/i) || m[0].match(/data-src="(https?:\/\/[^"]+)"/i);
+    if (sm) still = abs(sm[1]);
+
+    var air = "";
+    var dm = m[0].match(/(\d{1,2}\s+de\s+\w+\s+de\s+20\d{2})/i);
+    if (dm) air = strip(dm[1]);
+
+    eps.push({
+      season: 1,
+      number: num,
+      ref: "ep:" + slug + ":" + num,
+      title: "Episodio " + num,
+      still: still || undefined,
+      airDate: air || undefined,
+    });
   }
 
-  if (!html) {
-    // Try episode 1 page and discover series link
-    try {
-      const epHtml = await fetchText(BASE + "/hentaionline/" + seriesSlug + "-1.html");
-      const link = epHtml.match(/href="(\/infohentai\/[a-z0-9\-_.]+\.html)"/i);
-      if (link) {
-        html = await fetchText(BASE + link[1]);
-      } else {
-        const eps = parseEpisodeList(epHtml, seriesSlug);
-        if (eps.length) {
-          return {
-            series: {
-              title: cleanTitle(seriesSlug.replace(/-/g, " ")),
-              genres: ["anime"],
-            },
-            episodes: eps,
-          };
-        }
-        throw lastErr || kino.error("not_found", "Serie no encontrada");
-      }
-    } catch (e2) {
-      throw lastErr || e2;
-    }
+  // sort by number ascending
+  eps.sort(function (a, b) {
+    return a.number - b.number;
+  });
+
+  // if no episodes found but page is a single video (rare), treat as ep 1
+  if (eps.length === 0 && /player\.php\?data=|player-logic|zarat_get_data/i.test(html)) {
+    eps.push({
+      season: 1,
+      number: 1,
+      ref: "ep:" + slug + ":1",
+      title: seriesTitle || "Episodio 1",
+    });
   }
 
-  let episodes = parseEpisodeList(html, seriesSlug);
-  if (!episodes.length) {
-    // Some series pages only list episode numbers differently
-    const loose = html.match(
-      new RegExp(
-        "/hentaionline/" +
-          seriesSlug.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
-          "-(\\d+)\\.html",
-        "gi"
-      )
-    );
-    if (loose && loose.length) {
-      episodes = parseEpisodeList(html, seriesSlug);
-    }
-  }
-  if (!episodes.length) {
-    // At least offer ep 1
-    episodes = [{ season: 1, number: 1, ref: "ep:" + seriesSlug + ":1", title: "Episodio 1" }];
-  }
-
-  let title = seriesSlug.replace(/-/g, " ");
-  const titleMatch =
-    html.match(/<h1[^>]*>[\s\S]*?<span[^>]*>([^<]+)<\/span>/i) ||
-    html.match(/<h1[^>]*>([^<]+)/i) ||
-    html.match(/og:title" content="([^"]+)"/i);
-  if (titleMatch) title = cleanTitle(titleMatch[1]);
-
-  let poster = pickPoster(html);
-  if (!poster) {
-    const og = html.match(/og:image" content="([^"]+)"/i);
-    if (og && !isAdUrl(og[1])) poster = og[1];
-  }
-
-  let overview;
-  const sinMatch = html.match(
-    /(?:Sinopsis|Descripción)[\s\S]{0,80}?<p[^>]*>([\s\S]{20,600}?)<\/p>/i
-  );
-  if (sinMatch) overview = sinMatch[1].replace(/<[^>]+>/g, "").trim().slice(0, 500);
-
-  return {
-    series: { title, poster, overview, genres: ["anime"] },
-    episodes,
+  var series = {
+    title: seriesTitle || slug.replace(/-/g, " "),
+    poster: poster || undefined,
+    overview: overview || undefined,
+    year: year || undefined,
   };
+
+  return { series: series, episodes: eps };
 }
 
 export async function resolve(ref) {
-  function pickMedia(page) {
-    const list = Array.isArray(page) ? page : (page && page.media) || [];
-    if (!list.length) return null;
-    const score = (c) => {
-      const u = (c.url || "") + " " + (c.mime || "");
-      if (!c.url || !/^https?:\/\//i.test(c.url)) return -1;
-      if (/blob:|data:/i.test(c.url)) return -1;
-      if (isAdUrl(c.url)) return -1;
-      if (/\/e\/[a-z0-9]+\/?$/i.test(c.url) && !/m3u8|mp4|mpd/i.test(u)) return -1;
-      let s = 0;
-      if (/m3u8|\.mpd|mpegurl|dash\+xml/i.test(u)) s += 100;
-      if (/\.mp4(\?|$)|video\/mp4/i.test(u)) s += 50;
-      if (/\/hls\/|playlist|manifest|master|urlset/i.test(u)) s += 30;
-      return s;
-    };
-    let best = null;
-    let bestScore = -1;
-    for (const c of list) {
-      const sc = score(c);
-      if (sc > bestScore) {
-        bestScore = sc;
-        best = c;
-      }
-    }
-    return bestScore >= 0 ? best : null;
-  }
+  var r = String(ref || "");
+  var slug, epNum;
 
-  function streamFrom(media, embedUrl, label, alternatives) {
-    let embedOrigin;
-    try {
-      embedOrigin = new URL(embedUrl).origin;
-    } catch {}
-
-    const headers = Object.assign({}, media.headers || {});
-    if (!headers["User-Agent"] && !headers["user-agent"]) headers["User-Agent"] = UA;
-    if (!headers.Referer && !headers.referer) headers.Referer = embedUrl;
-    if (!headers.Origin && !headers.origin && embedOrigin) headers.Origin = embedOrigin;
-
-    const isHls = /m3u8|\.mpd|mpegurl/i.test(media.url + " " + (media.mime || ""));
-    const out = {
-      url: media.url,
-      mime: media.mime || (isHls ? "application/vnd.apple.mpegurl" : undefined),
-      headers,
-      label: label || "Servidor",
-    };
-    if (alternatives && alternatives.length) out.alternatives = alternatives;
-    return out;
-  }
-
-  function urlsFromHtml(html) {
-    const found = [];
-    const re = /(https?:\/\/[^"'\\\s<>]+(?:\.m3u8|\.mpd|\.mp4)[^"'\\\s<>]*)/gi;
-    let m;
-    while ((m = re.exec(html))) {
-      const u = m[1].replace(/\\u002F/g, "/").replace(/\\\//g, "/");
-      if (!isAdUrl(u)) found.push(u);
-    }
-    const srcRe =
-      /["'](?:src|file|source|url)["']\s*:\s*["'](https?:\/\/[^"']+)["']/gi;
-    while ((m = srcRe.exec(html))) {
-      if (/\.m3u8|\.mp4|\.mpd|\/hls\/|playlist/i.test(m[1]) && !isAdUrl(m[1])) {
-        found.push(m[1]);
-      }
-    }
-    return [...new Set(found)];
-  }
-
-  async function captureEmbed(embedUrl, label) {
-    log("capture", label || "", embedUrl);
-    let host = "";
-    try {
-      host = new URL(embedUrl).hostname;
-    } catch {}
-
-    if (SKIP_EMBED.test(host) || isAdUrl(embedUrl)) {
-      log("skip ad/captcha host", host);
-      return null;
-    }
-
-    try {
-      const timeoutMs = label === "SaveFiles" || label === "Voe" || label === "Filemoon" ? 18000 : 14000;
-      const page = await kino.browser.capture(embedUrl, {
-        timeoutMs,
-        headers: { Referer: BASE + "/", "User-Agent": UA },
-        match:
-          "m3u8|\\.mpd|\\.mp4|master|playlist|/hls/|videoplayback|manifest|index\\.m3u|urlset",
-      });
-      const media = pickMedia(page);
-      if (media) {
-        log("capture ok", label || "", media.url.slice(0, 140));
-        return media;
-      }
-    } catch (e) {
-      const msg = e.message || String(e);
-      log("capture err", label || "", msg);
-      if (/confirm a human|captcha|blocked/i.test(msg)) return null;
-    }
-
-    if (kino.browser && typeof kino.browser.page === "function") {
-      try {
-        const doc = await kino.browser.page(embedUrl, {
-          timeoutMs: 8000,
-          headers: { Referer: BASE + "/", "User-Agent": UA },
-        });
-        const html = (doc && (doc.html || doc.text || doc.body)) || "";
-        const urls = urlsFromHtml(html);
-        if (urls.length) {
-          const u = urls.find((x) => /m3u8/i.test(x)) || urls[0];
-          log("page-extract ok", label || "", u.slice(0, 140));
-          return {
-            url: u,
-            mime: /m3u8/i.test(u) ? "application/vnd.apple.mpegurl" : undefined,
-            headers: { Referer: embedUrl, "User-Agent": UA },
-          };
-        }
-      } catch (e) {
-        log("page fallback", label || "", e.message);
-      }
-    }
-
-    try {
-      const r = await kino.fetch(embedUrl, {
-        headers: { "User-Agent": UA, Referer: BASE + "/", Accept: "text/html,*/*" },
-        cookies: false,
-        timeoutMs: 8000,
-      });
-      if (r.ok) {
-        const urls = urlsFromHtml(await r.text());
-        if (urls.length) {
-          const u = urls.find((x) => /m3u8/i.test(x)) || urls[0];
-          log("fetch-extract ok", label || "", u.slice(0, 140));
-          return {
-            url: u,
-            mime: /m3u8/i.test(u) ? "application/vnd.apple.mpegurl" : undefined,
-            headers: { Referer: embedUrl, "User-Agent": UA },
-          };
-        }
-      }
-    } catch (e) {
-      log("fetch fallback", label || "", e.message);
-    }
-    return null;
-  }
-
-  // Lazy alternative: embed:URL
-  if (String(ref).startsWith("embed:")) {
-    const embedUrl = decodeURIComponent(String(ref).slice(6));
-    if (isAdUrl(embedUrl) || SKIP_EMBED.test(embedUrl)) {
-      throw kino.error("unavailable", "Servidor no disponible (anuncio o captcha)");
-    }
-    try {
-      const media = await captureEmbed(embedUrl, serverLabel(embedUrl));
-      if (media) return streamFrom(media, embedUrl, serverLabel(embedUrl));
-    } catch (e) {
-      log("lazy embed failed", e.message);
-    }
-    throw kino.error("unavailable", "No se pudo cargar este servidor");
-  }
-
-  let seriesSlug, epNum;
-  if (String(ref).startsWith("ep:")) {
-    const parts = String(ref).slice(3).split(":");
-    seriesSlug = parts[0];
-    epNum = parseInt(parts[1], 10);
-  } else if (String(ref).startsWith("series:")) {
-    seriesSlug = String(ref).slice(7);
+  var em = r.match(/^ep:([^:]+):(\d+)$/);
+  if (em) {
+    slug = em[1];
+    epNum = parseInt(em[2], 10);
+  } else if (r.indexOf("series:") === 0) {
+    // resolve first episode if someone resolves the series
+    slug = r.replace(/^series:/, "");
     epNum = 1;
   } else {
-    throw kino.error("not_found", "Referencia inválida");
-  }
-  if (!seriesSlug || !epNum) throw kino.error("not_found", "Episodio no encontrado");
-
-  const pageUrl = BASE + "/hentaionline/" + seriesSlug + "-" + epNum + ".html";
-  let html;
-  try {
-    html = await fetchText(pageUrl);
-  } catch (e) {
-    throw kino.error(
-      "unavailable",
-      "Episodio no disponible (" + seriesSlug + "-" + epNum + ")"
-    );
+    throw new Error("ref no resoluble: " + r);
   }
 
-  const servers = extractServers(html);
-  if (!servers.length) {
-    throw kino.error(
-      "unavailable",
-      "No hay servidores reproducibles (solo anuncios o captcha)"
-    );
-  }
+  var pageUrl =
+    BASE + "/online/" + slug + (epNum ? "/episodio-" + epNum + "/" : "/");
+  var html = await fetchText(pageUrl, { Referer: BASE + "/online/" + slug + "/" });
 
-  const tried = [];
-  const maxTry = Math.min(servers.length, 4);
-  for (let i = 0; i < maxTry; i++) {
-    const s = servers[i];
-    tried.push(s.label);
-    try {
-      const media = await captureEmbed(s.url, s.label);
-      if (media) {
-        const alternatives = servers
-          .filter((_, j) => j !== i)
-          .slice(0, 8)
-          .map((x) => ({
-            label: x.label,
-            ref: "embed:" + encodeURIComponent(x.url),
-          }));
-        return streamFrom(media, s.url, s.label, alternatives);
-      }
-    } catch (e) {
-      log("server failed", s.label, e.message);
+  // extract player.php?data=...
+  var dm = html.match(/player\.php\?data=([^"&\s]+)/i);
+  if (!dm) {
+    // maybe single-page without /episodio-
+    if (epNum === 1) {
+      var html2 = await fetchText(BASE + "/online/" + slug + "/");
+      dm = html2.match(/player\.php\?data=([^"&\s]+)/i);
+      if (dm) html = html2;
     }
   }
+  if (!dm) {
+    throw kino.error("unavailable", "no-player-data", {
+      userMessage: "No se encontró el reproductor en esta página.",
+    });
+  }
 
-  throw kino.error(
-    "unavailable",
-    "No se extrajo stream de: " + tried.join(", ") + ". Prueba otro servidor."
-  );
+  var dataB64 = decodeURIComponent(dm[1]);
+  var raw;
+  try {
+    // pad base64
+    var pad = dataB64 + "===".slice(0, (4 - (dataB64.length % 4)) % 4);
+    raw = atob(pad);
+  } catch (e) {
+    throw new Error("data base64 inválido");
+  }
+
+  // separator is :|::|:
+  var parts = raw.split(":|::|:");
+  if (parts.length < 2) {
+    // try alternate
+    parts = raw.split(":|:|");
+  }
+  if (parts.length < 2) {
+    throw new Error("token de player incompleto");
+  }
+  var en = parts[0];
+  var iv = parts[1];
+  var b = btoa(iv);
+
+  // POST to api.php
+  var boundary = "----KinoBoundary" + Date.now().toString(36);
+  var body =
+    "--" +
+    boundary +
+    "\r\nContent-Disposition: form-data; name=\"action\"\r\n\r\nzarat_get_data_player_ajax\r\n--" +
+    boundary +
+    "\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n" +
+    en +
+    "\r\n--" +
+    boundary +
+    "\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\n" +
+    b +
+    "\r\n--" +
+    boundary +
+    "--\r\n";
+
+  var apiRes = await kino.fetch(BASE + "/wp-content/plugins/player-logic/api.php", {
+    method: "POST",
+    headers: hdr({
+      "Content-Type": "multipart/form-data; boundary=" + boundary,
+      Origin: BASE,
+      Referer: pageUrl,
+      Accept: "*/*",
+    }),
+    body: body,
+    timeoutMs: 14000,
+  });
+  if (!apiRes.ok) {
+    throw kino.error("unavailable", "api-" + apiRes.status, {
+      userMessage: "El servidor de vídeo no respondió (" + apiRes.status + ").",
+    });
+  }
+  var apiJson = JSON.parse(await apiRes.text());
+  if (!apiJson.status || !apiJson.data || !apiJson.data.sources || !apiJson.data.sources.length) {
+    throw kino.error("unavailable", "no-sources", {
+      userMessage: "No hay fuentes de vídeo disponibles.",
+    });
+  }
+
+  var src = apiJson.data.sources[0];
+  var m3u8 = src.src;
+  if (!m3u8 || m3u8.indexOf("http") !== 0) {
+    throw new Error("url de stream inválida");
+  }
+
+  // Prefer Spanish subtitles: parse master playlist
+  var subtitles = [];
+  try {
+    var plRes = await kino.fetch(m3u8, {
+      headers: hdr({ Referer: pageUrl, Accept: "*/*" }),
+      timeoutMs: 10000,
+    });
+    if (plRes.ok) {
+      var pl = await plRes.text();
+      var subRe =
+        /#EXT-X-MEDIA:[^\n]*TYPE=SUBTITLES[^\n]*LANGUAGE="([^"]+)"[^\n]*NAME="([^"]*)"[^\n]*URI="([^"]+)"/gi;
+      var sm;
+      var basePl = m3u8.replace(/\/[^/]*$/, "/");
+      var found = [];
+      while ((sm = subRe.exec(pl))) {
+        var lang = sm[1].toLowerCase();
+        var name = sm[2] || lang;
+        var uri = sm[3];
+        if (uri.indexOf("http") !== 0) uri = basePl + uri.replace(/^\.\//, "");
+        found.push({ lang: lang, url: uri, format: uri.indexOf(".vtt") >= 0 ? "vtt" : undefined, label: name });
+      }
+      // priority: es first, then en, then rest
+      found.sort(function (a, b) {
+        var score = function (l) {
+          if (l === "es" || l === "spa" || l === "es-es" || l === "es-mx") return 0;
+          if (l === "en" || l === "eng") return 1;
+          return 2;
+        };
+        return score(a.lang) - score(b.lang);
+      });
+      subtitles = found;
+    }
+  } catch (e) {
+    // ignore subtitle parse errors
+  }
+
+  // also try direct known paths if playlist didn't list them
+  if (subtitles.length === 0) {
+    var baseUuid = m3u8.replace(/\/playlist[^/]*\.m3u8.*$/i, "/");
+    subtitles = [
+      { lang: "es", url: baseUuid + "s/es.vtt", format: "vtt", label: "Español" },
+      { lang: "en", url: baseUuid + "s/en.vtt", format: "vtt", label: "English" },
+    ];
+  }
+
+  var stream = {
+    url: m3u8,
+    mime: "application/x-mpegURL",
+    headers: {
+      "User-Agent": UA,
+      Referer: BASE + "/",
+      Origin: BASE,
+    },
+    subtitles: subtitles.length ? subtitles : undefined,
+    label: src.label || "Auto",
+  };
+
+  return stream;
 }
