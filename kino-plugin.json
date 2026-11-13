@@ -1,10 +1,10 @@
 {
   "id": "verhentai",
   "name": "VerHentai",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "apiVersion": 6,
   "entry": "plugin.js",
-  "description": "Hentai en español de verhentai.com. Series con episodios, subtítulos online (español genérico por defecto), HLS. Secciones de inicio iguales a la web.",
+  "description": "Hentai en español de verhentai.com. Series con episodios, subtítulos online (Español (genérico) por defecto), HLS. Secciones de inicio iguales a la web.",
   "author": "Hotaru Yume",
   "creator": "hotaruyume",
   "homepage": "https://verhentai.com",

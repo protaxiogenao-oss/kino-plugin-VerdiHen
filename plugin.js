@@ -1,6 +1,6 @@
 /// <reference path="./kino.d.ts" />
 /**
- * VerHentai — Kino plugin v1.0.1
+ * VerHentai — Kino plugin v1.0.2
  * Author: Hotaru Yume / hotaruyume
  * Fuente: verhentai.com
  * - Home con las mismas secciones de la web (Estrenos, Tendencias, Sin Censura, Incesto, Milfs, Furry)
@@ -8,7 +8,7 @@
  * - Resolve vía player-logic API → HLS octopusmanifest
  * - Subtítulos online: español genérico (es) por defecto / primero
  * - Sin anuncios / embeds de ads
- * v1.0.1: label "Español" genérico; es siempre primero en la lista
+ * v1.0.2: label exacto "Español (genérico)"; solo es+en primero
  */
 
 const BASE = "https://verhentai.com";
@@ -468,8 +468,11 @@ export async function resolve(ref) {
     throw new Error("url de stream inválida");
   }
 
-  // Subtítulos: español genérico (es) siempre primero y con label "Español"
+  // Subtítulos: el master HLS declara NAME="Spanish" y English DEFAULT=YES.
+  // Devolvemos pistas externas con label exacto "Español (genérico)" (como el menú de Kino)
+  // y lang "es" en primer lugar para que sea la opción predeterminada del plugin.
   var subtitles = [];
+  var basePl = m3u8.replace(/\/[^/]*$/, "/");
   try {
     var plRes = await kino.fetch(m3u8, {
       headers: hdr({ Referer: pageUrl, Accept: "*/*" }),
@@ -480,52 +483,45 @@ export async function resolve(ref) {
       var subRe =
         /#EXT-X-MEDIA:[^\n]*TYPE=SUBTITLES[^\n]*LANGUAGE="([^"]+)"[^\n]*NAME="([^"]*)"[^\n]*URI="([^"]+)"/gi;
       var sm;
-      var basePl = m3u8.replace(/\/[^/]*$/, "/");
-      var found = [];
+      var esUrl = "";
+      var enUrl = "";
       while ((sm = subRe.exec(pl))) {
         var lang = (sm[1] || "").toLowerCase();
         var uri = sm[3];
         if (uri.indexOf("http") !== 0) uri = basePl + uri.replace(/^\.\//, "");
-        // Normalizar a español genérico
-        var isEs = lang === "es" || lang === "spa" || lang.indexOf("es-") === 0 || lang.indexOf("es_") === 0;
-        var isEn = lang === "en" || lang === "eng" || lang.indexOf("en-") === 0;
-        var outLang = isEs ? "es" : isEn ? "en" : lang;
-        var outLabel = isEs ? "Español" : isEn ? "English" : (sm[2] || lang);
-        found.push({
-          lang: outLang,
-          url: uri,
-          format: uri.indexOf(".vtt") >= 0 ? "vtt" : undefined,
-          label: outLabel,
+        if (lang === "es" || lang === "spa" || lang.indexOf("es-") === 0 || lang.indexOf("es_") === 0) {
+          if (!esUrl) esUrl = uri;
+        } else if (lang === "en" || lang === "eng" || lang.indexOf("en-") === 0) {
+          if (!enUrl) enUrl = uri;
+        }
+      }
+      if (esUrl) {
+        subtitles.push({
+          lang: "es",
+          url: esUrl,
+          format: "vtt",
+          label: "Español (genérico)",
         });
       }
-      // Español genérico primero, luego inglés, luego el resto
-      found.sort(function (a, b) {
-        var score = function (l) {
-          if (l === "es") return 0;
-          if (l === "en") return 1;
-          return 2;
-        };
-        return score(a.lang) - score(b.lang);
-      });
-      // Evitar duplicados de lang (quedarse con el primero = el de mayor prioridad)
-      var seenLang = {};
-      subtitles = [];
-      for (var i = 0; i < found.length; i++) {
-        if (seenLang[found[i].lang]) continue;
-        seenLang[found[i].lang] = true;
-        subtitles.push(found[i]);
+      if (enUrl) {
+        subtitles.push({
+          lang: "en",
+          url: enUrl,
+          format: "vtt",
+          label: "Inglés",
+        });
       }
+
     }
   } catch (e) {
-    // ignore subtitle parse errors
+    // ignore; keep master + empty subs
   }
 
-  // Si el master no listó pistas, forzar español genérico + inglés
   if (subtitles.length === 0) {
     var baseUuid = m3u8.replace(/\/playlist[^/]*\.m3u8.*$/i, "/");
     subtitles = [
-      { lang: "es", url: baseUuid + "s/es.vtt", format: "vtt", label: "Español" },
-      { lang: "en", url: baseUuid + "s/en.vtt", format: "vtt", label: "English" },
+      { lang: "es", url: baseUuid + "s/es.vtt", format: "vtt", label: "Español (genérico)" },
+      { lang: "en", url: baseUuid + "s/en.vtt", format: "vtt", label: "Inglés" },
     ];
   }
 
