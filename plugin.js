@@ -1,14 +1,14 @@
 /// <reference path="./kino.d.ts" />
 /**
- * VerHentai — Kino plugin v1.0.2
+ * VerHentai — Kino plugin v1.0.3
  * Author: Hotaru Yume / hotaruyume
  * Fuente: verhentai.com
- * - Home con las mismas secciones de la web (Estrenos, Tendencias, Sin Censura, Incesto, Milfs, Furry)
+ * - Home: Estrenos, Tendencias, Sin Censura, Incesto, Milfs, Furry…
  * - Series + episodios
- * - Resolve vía player-logic API → HLS octopusmanifest
- * - Subtítulos online: español genérico (es) por defecto / primero
- * - Sin anuncios / embeds de ads
- * v1.0.2: label exacto "Español (genérico)"; solo es+en primero
+ * - Resolve: player-logic API → HLS (octopusmanifest + master-lengs / esp-rrr)
+ * - Subtítulos: ajuste preferSub; master HLS reescrito con Español (genérico) DEFAULT
+ * - streamHosts any + hosts de ambos CDN
+ * v1.0.3: preferSub setting; rewrite DEFAULT es; resolve multi-intento; más hosts CDN
  */
 
 const BASE = "https://verhentai.com";
@@ -70,13 +70,21 @@ function isAdBlock(title, path, block) {
   return AD_RE.test(t);
 }
 
-async function fetchText(url, extra) {
-  var r = await kino.fetch(url, {
-    headers: hdr(extra),
-    timeoutMs: 16000,
-  });
-  if (!r.ok) throw new Error("HTTP " + r.status + " " + url);
-  return await r.text();
+async function fetchText(url, extra, soft) {
+  try {
+    var r = await kino.fetch(url, {
+      headers: hdr(extra),
+      timeoutMs: 16000,
+    });
+    if (!r.ok) {
+      if (soft) return "";
+      throw new Error("HTTP " + r.status + " " + url);
+    }
+    return await r.text();
+  } catch (e) {
+    if (soft) return "";
+    throw e;
+  }
 }
 
 function parseItems(html, max) {
@@ -99,12 +107,10 @@ function parseItems(html, max) {
     return byId[slug];
   }
 
-  // .item > a[href*="/online/"] with cover img
   var reItem =
     /<div[^>]*class="[^"]*\bitem\b[^"]*"[^>]*>[\s\S]*?<a[^>]+href="((?:https?:\/\/verhentai\.com)?\/online\/([^"/?#]+)\/?)"[^>]*>[\s\S]*?<\/a>[\s\S]*?<\/div>/gi;
   var m;
   while ((m = reItem.exec(html))) {
-    var full = m[1];
     var slug = m[2];
     if (!slug || /episodio|episode/i.test(slug)) continue;
     var block = m[0];
@@ -131,7 +137,6 @@ function parseItems(html, max) {
       if (titleEl) rec.title = strip(titleEl[1]);
     }
     if (!rec.title) {
-      // slug to title
       rec.title = slug
         .replace(/-/g, " ")
         .replace(/\b\w/g, function (c) {
@@ -140,7 +145,6 @@ function parseItems(html, max) {
     }
   }
 
-  // fallback: any /online/slug/ link with nearby img
   if (order.length < 4) {
     var reLink =
       /<a[^>]+href="((?:https?:\/\/verhentai\.com)?\/online\/([^"/?#]+)\/?)"[^>]*>([\s\S]*?)<\/a>/gi;
@@ -157,7 +161,7 @@ function parseItems(html, max) {
         }
       }
       if (!rec2.title || rec2.title.length < 3) {
-        var al = m[3].match(/alt="([^"]{2,})"/i);
+        var al = m[3].match(/alt="([^"]{3,})"/i);
         if (al) rec2.title = strip(al[1].replace(/\s*cover\s*$/i, ""));
       }
       if (!rec2.title) {
@@ -182,11 +186,145 @@ function sectionRef(path) {
   return "browse:" + path.replace(/^\//, "");
 }
 
+function preferSubSetting() {
+  try {
+    var v = kino.config && kino.config.get ? kino.config.get("preferSub") : null;
+    if (v === "en" || v === "off" || v === "es") return v;
+  } catch (e) {}
+  return "es";
+}
+
+/** Rewrite master playlist: Spanish DEFAULT=YES, rename to Español (genérico), absolutize URIs */
+function rewriteMasterForSpanish(pl, basePl, prefer) {
+  if (!pl || prefer === "off") return null;
+  var lines = pl.split("\n");
+  var out = [];
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    if (/TYPE=SUBTITLES/i.test(line) && /LANGUAGE="/i.test(line)) {
+      var langM = line.match(/LANGUAGE="([^"]+)"/i);
+      var lang = langM ? langM[1].toLowerCase() : "";
+      var isEs = lang === "es" || lang === "spa" || lang.indexOf("es-") === 0;
+      var isEn = lang === "en" || lang === "eng" || lang.indexOf("en-") === 0;
+
+      // Absolutize URI=
+      line = line.replace(/URI="([^"]+)"/i, function (_, u) {
+        if (u.indexOf("http") === 0) return 'URI="' + u + '"';
+        return 'URI="' + basePl + u.replace(/^\.\//, "") + '"';
+      });
+
+      if (prefer === "es" && isEs) {
+        line = line.replace(/NAME="[^"]*"/i, 'NAME="Español (genérico)"');
+        line = line.replace(/DEFAULT=NO/gi, "DEFAULT=YES");
+        line = line.replace(/AUTOSELECT=NO/gi, "AUTOSELECT=YES");
+        if (!/DEFAULT=/i.test(line)) line += ",DEFAULT=YES,AUTOSELECT=YES";
+      } else if (prefer === "es" && isEn) {
+        line = line.replace(/DEFAULT=YES/gi, "DEFAULT=NO");
+        line = line.replace(/AUTOSELECT=YES/gi, "AUTOSELECT=NO");
+      } else if (prefer === "en" && isEn) {
+        line = line.replace(/DEFAULT=NO/gi, "DEFAULT=YES");
+        line = line.replace(/AUTOSELECT=NO/gi, "AUTOSELECT=YES");
+      } else if (prefer === "en" && isEs) {
+        line = line.replace(/DEFAULT=YES/gi, "DEFAULT=NO");
+      }
+      out.push(line);
+      continue;
+    }
+    // Absolutize relative media playlist paths (non-# lines)
+    if (line && line.charAt(0) !== "#" && /\.m3u8|index\.txt/i.test(line) && line.indexOf("http") !== 0) {
+      out.push(basePl + line.replace(/^\.\//, ""));
+      continue;
+    }
+    // Absolutize URI= on audio etc.
+    if (/URI="/i.test(line) && !/^#EXT-X-STREAM-INF/i.test(line)) {
+      line = line.replace(/URI="([^"]+)"/i, function (_, u) {
+        if (u.indexOf("http") === 0) return 'URI="' + u + '"';
+        return 'URI="' + basePl + u.replace(/^\.\//, "") + '"';
+      });
+    }
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
+async function loadEpisodeHtml(slug, epNum) {
+  var candidates = [];
+  if (epNum) {
+    candidates.push(BASE + "/online/" + slug + "/episodio-" + epNum + "/");
+    candidates.push(BASE + "/online/" + slug + "/episodio-" + epNum);
+  }
+  candidates.push(BASE + "/online/" + slug + "/");
+  candidates.push(BASE + "/online/" + slug);
+
+  var lastHtml = "";
+  var lastUrl = candidates[0];
+  for (var i = 0; i < candidates.length; i++) {
+    var url = candidates[i];
+    var html = await fetchText(url, { Referer: BASE + "/online/" + slug + "/" }, true);
+    if (!html) continue;
+    lastHtml = html;
+    lastUrl = url;
+    if (/player\.php\?data=/i.test(html)) {
+      return { html: html, pageUrl: url };
+    }
+  }
+  return { html: lastHtml, pageUrl: lastUrl };
+}
+
+function extractPlayerData(html) {
+  if (!html) return null;
+  var dm =
+    html.match(/player\.php\?data=([^"&\s]+)/i) ||
+    html.match(/data=([A-Za-z0-9+/=%:]{40,})/i);
+  return dm ? dm[1] : null;
+}
+
+async function callPlayerApi(en, iv, pageUrl) {
+  var b = btoa(iv);
+  var boundary = "----KinoBoundary" + Date.now().toString(36);
+  var body =
+    "--" +
+    boundary +
+    '\r\nContent-Disposition: form-data; name="action"\r\n\r\nzarat_get_data_player_ajax\r\n--' +
+    boundary +
+    '\r\nContent-Disposition: form-data; name="a"\r\n\r\n' +
+    en +
+    "\r\n--" +
+    boundary +
+    '\r\nContent-Disposition: form-data; name="b"\r\n\r\n' +
+    b +
+    "\r\n--" +
+    boundary +
+    "--\r\n";
+
+  var apiRes = await kino.fetch(BASE + "/wp-content/plugins/player-logic/api.php", {
+    method: "POST",
+    headers: hdr({
+      "Content-Type": "multipart/form-data; boundary=" + boundary,
+      Origin: BASE,
+      Referer: pageUrl,
+      Accept: "*/*",
+    }),
+    body: body,
+    timeoutMs: 16000,
+  });
+  if (!apiRes.ok) {
+    throw kino.error("unavailable", "api-" + apiRes.status, {
+      userMessage: "El servidor de vídeo no respondió (" + apiRes.status + "). Prueba otro episodio.",
+    });
+  }
+  var apiJson = JSON.parse(await apiRes.text());
+  if (!apiJson.status || !apiJson.data || !apiJson.data.sources || !apiJson.data.sources.length) {
+    throw kino.error("unavailable", "no-sources", {
+      userMessage: "No hay fuentes de vídeo disponibles para este episodio.",
+    });
+  }
+  return apiJson;
+}
+
 export async function home() {
   var html = await fetchText(BASE + "/");
   var rows = [];
-
-  // Extract blocks by h3.htitle
   var reSec =
     /<h3[^>]*class="[^"]*htitle[^"]*"[^>]*>\s*([^<]+?)(?:\s*<a[^>]+href="([^"]+)"[^>]*>[\s\S]*?<\/a>)?\s*<\/h3>\s*<div[^>]*class="[^"]*block_slider[^"]*"[^>]*>([\s\S]*?)(?=<h3[^>]*class="[^"]*htitle|<\/div>\s*<\/div>\s*<\/div>\s*<div class="block"|$)/gi;
 
@@ -215,7 +353,6 @@ export async function home() {
     rows.push(row);
   }
 
-  // Fallback if regex missed: known sections
   if (rows.length === 0) {
     var all = parseItems(html, HOME_ROW * 3);
     if (all.length) {
@@ -250,7 +387,6 @@ export async function browse(ref, cursor) {
   if (items.length >= Math.min(20, MAX_PAGE - 4)) {
     next = "page=" + (page + 1);
   }
-  // also check for next link
   if (!next && /rel="next"|class="[^"]*next[^"]*"|›|»|Siguiente/i.test(html)) {
     next = "page=" + (page + 1);
   }
@@ -290,7 +426,6 @@ export async function episodes(ref) {
   var url = BASE + "/online/" + slug + "/";
   var html = await fetchText(url);
 
-  // series info
   var seriesTitle = "";
   var tm = html.match(/<h1[^>]*>([^<]{2,})<\/h1>/i) || html.match(/property="og:title"\s+content="([^"]+)"/i);
   if (tm) seriesTitle = strip(tm[1]);
@@ -309,7 +444,6 @@ export async function episodes(ref) {
   var ym = html.match(/>\s*(20\d{2})\s*</);
   if (ym) year = ym[1];
 
-  // episodes list
   var eps = [];
   var reEp =
     /<a[^>]+href="((?:https?:\/\/verhentai\.com)?\/online\/[^"]+\/episodio-(\d+)\/?)"[^>]*>[\s\S]*?(?:Episodio\s*(\d+)|Episode\s*(\d+))?[\s\S]*?<\/a>/gi;
@@ -338,12 +472,10 @@ export async function episodes(ref) {
     });
   }
 
-  // sort by number ascending
   eps.sort(function (a, b) {
     return a.number - b.number;
   });
 
-  // if no episodes found but page is a single video (rare), treat as ep 1
   if (eps.length === 0 && /player\.php\?data=|player-logic|zarat_get_data/i.test(html)) {
     eps.push({
       season: 1,
@@ -353,14 +485,15 @@ export async function episodes(ref) {
     });
   }
 
-  var series = {
-    title: seriesTitle || slug.replace(/-/g, " "),
-    poster: poster || undefined,
-    overview: overview || undefined,
-    year: year || undefined,
+  return {
+    series: {
+      title: seriesTitle || slug.replace(/-/g, " "),
+      poster: poster || undefined,
+      overview: overview || undefined,
+      year: year || undefined,
+    },
+    episodes: eps,
   };
-
-  return { series: series, episodes: eps };
 }
 
 export async function resolve(ref) {
@@ -372,114 +505,76 @@ export async function resolve(ref) {
     slug = em[1];
     epNum = parseInt(em[2], 10);
   } else if (r.indexOf("series:") === 0) {
-    // resolve first episode if someone resolves the series
     slug = r.replace(/^series:/, "");
     epNum = 1;
   } else {
     throw new Error("ref no resoluble: " + r);
   }
 
-  var pageUrl =
-    BASE + "/online/" + slug + (epNum ? "/episodio-" + epNum + "/" : "/");
-  var html = await fetchText(pageUrl, { Referer: BASE + "/online/" + slug + "/" });
+  var loaded = await loadEpisodeHtml(slug, epNum);
+  var html = loaded.html;
+  var pageUrl = loaded.pageUrl;
+  var dataParam = extractPlayerData(html);
 
-  // extract player.php?data=...
-  var dm = html.match(/player\.php\?data=([^"&\s]+)/i);
-  if (!dm) {
-    // maybe single-page without /episodio-
-    if (epNum === 1) {
-      var html2 = await fetchText(BASE + "/online/" + slug + "/");
-      dm = html2.match(/player\.php\?data=([^"&\s]+)/i);
-      if (dm) html = html2;
-    }
-  }
-  if (!dm) {
+  if (!dataParam) {
     throw kino.error("unavailable", "no-player-data", {
-      userMessage: "No se encontró el reproductor en esta página.",
+      userMessage:
+        "No se encontró el reproductor en este episodio. Puede que aún no esté disponible o el enlace esté roto.",
     });
   }
 
-  var dataB64 = decodeURIComponent(dm[1]);
+  var dataB64 = decodeURIComponent(dataParam);
   var raw;
   try {
-    // pad base64
     var pad = dataB64 + "===".slice(0, (4 - (dataB64.length % 4)) % 4);
     raw = atob(pad);
   } catch (e) {
-    throw new Error("data base64 inválido");
+    throw kino.error("unavailable", "bad-token", {
+      userMessage: "Token del reproductor inválido. Reintenta en unos segundos.",
+    });
   }
 
-  // separator is :|::|:
   var parts = raw.split(":|::|:");
+  if (parts.length < 2) parts = raw.split(":|:|");
   if (parts.length < 2) {
-    // try alternate
-    parts = raw.split(":|:|");
-  }
-  if (parts.length < 2) {
-    throw new Error("token de player incompleto");
+    throw kino.error("unavailable", "bad-token-parts", {
+      userMessage: "No se pudo decodificar el reproductor.",
+    });
   }
   var en = parts[0];
   var iv = parts[1];
-  var b = btoa(iv);
 
-  // POST to api.php
-  var boundary = "----KinoBoundary" + Date.now().toString(36);
-  var body =
-    "--" +
-    boundary +
-    "\r\nContent-Disposition: form-data; name=\"action\"\r\n\r\nzarat_get_data_player_ajax\r\n--" +
-    boundary +
-    "\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n" +
-    en +
-    "\r\n--" +
-    boundary +
-    "\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\n" +
-    b +
-    "\r\n--" +
-    boundary +
-    "--\r\n";
-
-  var apiRes = await kino.fetch(BASE + "/wp-content/plugins/player-logic/api.php", {
-    method: "POST",
-    headers: hdr({
-      "Content-Type": "multipart/form-data; boundary=" + boundary,
-      Origin: BASE,
-      Referer: pageUrl,
-      Accept: "*/*",
-    }),
-    body: body,
-    timeoutMs: 14000,
-  });
-  if (!apiRes.ok) {
-    throw kino.error("unavailable", "api-" + apiRes.status, {
-      userMessage: "El servidor de vídeo no respondió (" + apiRes.status + ").",
-    });
-  }
-  var apiJson = JSON.parse(await apiRes.text());
-  if (!apiJson.status || !apiJson.data || !apiJson.data.sources || !apiJson.data.sources.length) {
-    throw kino.error("unavailable", "no-sources", {
-      userMessage: "No hay fuentes de vídeo disponibles.",
-    });
-  }
-
+  var apiJson = await callPlayerApi(en, iv, pageUrl);
   var src = apiJson.data.sources[0];
   var m3u8 = src.src;
   if (!m3u8 || m3u8.indexOf("http") !== 0) {
-    throw new Error("url de stream inválida");
+    throw kino.error("unavailable", "bad-url", {
+      userMessage: "La fuente de vídeo no es válida.",
+    });
   }
 
-  // Subtítulos: el master HLS declara NAME="Spanish" y English DEFAULT=YES.
-  // Devolvemos pistas externas con label exacto "Español (genérico)" (como el menú de Kino)
-  // y lang "es" en primer lugar para que sea la opción predeterminada del plugin.
+  var prefer = preferSubSetting();
   var subtitles = [];
-  var basePl = m3u8.replace(/\/[^/]*$/, "/");
+  var streamUrl = m3u8;
+  var basePl = m3u8.replace(/\/[^/?#]*([?#].*)?$/, "/");
+  // keep query on master-lengs style URLs for the master itself
+  if (m3u8.indexOf("?") >= 0 && /master\.m3u8|playlist/i.test(m3u8)) {
+    basePl = m3u8.replace(/\/[^/]*$/, "/");
+  }
+
   try {
     var plRes = await kino.fetch(m3u8, {
       headers: hdr({ Referer: pageUrl, Accept: "*/*" }),
-      timeoutMs: 10000,
+      timeoutMs: 12000,
     });
     if (plRes.ok) {
       var pl = await plRes.text();
+      if (!pl || pl.length < 20 || pl.indexOf("#EXTM3U") < 0) {
+        throw kino.error("unavailable", "bad-playlist", {
+          userMessage: "La lista de reproducción no es válida o expiró. Reintenta.",
+        });
+      }
+
       var subRe =
         /#EXT-X-MEDIA:[^\n]*TYPE=SUBTITLES[^\n]*LANGUAGE="([^"]+)"[^\n]*NAME="([^"]*)"[^\n]*URI="([^"]+)"/gi;
       var sm;
@@ -489,40 +584,71 @@ export async function resolve(ref) {
         var lang = (sm[1] || "").toLowerCase();
         var uri = sm[3];
         if (uri.indexOf("http") !== 0) uri = basePl + uri.replace(/^\.\//, "");
-        if (lang === "es" || lang === "spa" || lang.indexOf("es-") === 0 || lang.indexOf("es_") === 0) {
+        if (lang === "es" || lang === "spa" || lang.indexOf("es-") === 0) {
           if (!esUrl) esUrl = uri;
         } else if (lang === "en" || lang === "eng" || lang.indexOf("en-") === 0) {
           if (!enUrl) enUrl = uri;
         }
       }
-      if (esUrl) {
-        subtitles.push({
-          lang: "es",
-          url: esUrl,
-          format: "vtt",
-          label: "Español (genérico)",
-        });
-      }
-      if (enUrl) {
-        subtitles.push({
-          lang: "en",
-          url: enUrl,
-          format: "vtt",
-          label: "Inglés",
-        });
+
+      if (prefer !== "off") {
+        if (prefer === "es" && esUrl) {
+          subtitles.push({
+            lang: "es",
+            url: esUrl,
+            format: "vtt",
+            label: "Español (genérico)",
+          });
+          if (enUrl)
+            subtitles.push({ lang: "en", url: enUrl, format: "vtt", label: "Inglés" });
+        } else if (prefer === "en" && enUrl) {
+          subtitles.push({ lang: "en", url: enUrl, format: "vtt", label: "Inglés" });
+          if (esUrl)
+            subtitles.push({
+              lang: "es",
+              url: esUrl,
+              format: "vtt",
+              label: "Español (genérico)",
+            });
+        } else {
+          if (esUrl)
+            subtitles.push({
+              lang: "es",
+              url: esUrl,
+              format: "vtt",
+              label: "Español (genérico)",
+            });
+          if (enUrl)
+            subtitles.push({ lang: "en", url: enUrl, format: "vtt", label: "Inglés" });
+        }
       }
 
+      // Reescribir master (Español DEFAULT=YES) y ofrecerlo como alternativa.
+      // La URL principal sigue siendo el m3u8 original (más compatible en TV/móvil).
+      if (prefer === "es" || prefer === "en") {
+        var rewritten = rewriteMasterForSpanish(pl, basePl, prefer);
+        if (rewritten && /TYPE=SUBTITLES/i.test(rewritten)) {
+          streamUrl = m3u8; // principal: original
+          // guardamos rewritten en variable para alternatives más abajo
+          pl = rewritten; // mark that we have a rewritten version
+        }
+      }
     }
   } catch (e) {
-    // ignore; keep master + empty subs
+    if (e && e.code) throw e;
+    // playlist fetch failed — still try original m3u8
   }
 
-  if (subtitles.length === 0) {
+  // Fallback VTT paths only for octopus-style UUIDs
+  if (subtitles.length === 0 && prefer !== "off" && /octopusmanifest\.org/i.test(m3u8)) {
     var baseUuid = m3u8.replace(/\/playlist[^/]*\.m3u8.*$/i, "/");
-    subtitles = [
-      { lang: "es", url: baseUuid + "s/es.vtt", format: "vtt", label: "Español (genérico)" },
-      { lang: "en", url: baseUuid + "s/en.vtt", format: "vtt", label: "Inglés" },
-    ];
+    if (prefer === "es" || prefer === "en") {
+      subtitles = [
+        { lang: "es", url: baseUuid + "s/es.vtt", format: "vtt", label: "Español (genérico)" },
+        { lang: "en", url: baseUuid + "s/en.vtt", format: "vtt", label: "Inglés" },
+      ];
+      if (prefer === "en") subtitles.reverse();
+    }
   }
 
   var stream = {
@@ -536,6 +662,14 @@ export async function resolve(ref) {
     subtitles: subtitles.length ? subtitles : undefined,
     label: src.label || "Auto",
   };
+
+  // master-lengs y similares: hash con caducidad
+  var expM = m3u8.match(/expirein=(\d+)/i) || m3u8.match(/expires?=(\d+)/i);
+  if (expM) {
+    var exp = parseInt(expM[1], 10);
+    var now = Math.floor(Date.now() / 1000);
+    if (exp > now + 30) stream.expiresInSeconds = exp - now;
+  }
 
   return stream;
 }

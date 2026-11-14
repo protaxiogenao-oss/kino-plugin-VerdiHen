@@ -1,10 +1,10 @@
 {
   "id": "verhentai",
   "name": "VerHentai",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "apiVersion": 6,
   "entry": "plugin.js",
-  "description": "Hentai en español de verhentai.com. Series con episodios, subtítulos online (Español (genérico) por defecto), HLS. Secciones de inicio iguales a la web.",
+  "description": "Hentai en español de verhentai.com. Series con episodios, HLS (octopus + master-lengs), subtítulos Español (genérico) por defecto o por ajuste.",
   "author": "Hotaru Yume",
   "creator": "hotaruyume",
   "homepage": "https://verhentai.com",
@@ -21,7 +21,12 @@
     "anpustream.com",
     "*.anpustream.com",
     "fdsk2s.anpustream.com",
-    "cdn.havenclick.com"
+    "cdn.havenclick.com",
+    "master-lengs.org",
+    "*.master-lengs.org",
+    "es.master-lengs.org",
+    "esp-rrr.top",
+    "*.esp-rrr.top"
   ],
   "streamHosts": "any",
   "capabilities": [
@@ -45,5 +50,17 @@
     "surface": "#1A1A1A",
     "highlight": "#F06292"
   },
-  "settings": []
+  "settings": [
+    {
+      "key": "preferSub",
+      "label": "Subtítulo preferido",
+      "type": "select",
+      "default": "es",
+      "options": [
+        { "value": "es", "label": "Español (genérico)" },
+        { "value": "en", "label": "Inglés" },
+        { "value": "off", "label": "Ninguno / solo los del vídeo" }
+      ]
+    }
+  ]
 }
